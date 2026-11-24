@@ -341,6 +341,84 @@ def finde_ust_ids(text):
 	return [u.replace(" ", "") for u in RE_UST_ID.findall(text)]
 
 
+# ---------------------------------------------------------------- PayPal-Zahlungsbelege
+
+# Dateiname eines Zahlungsbelegs (liegt neben seiner Rechnung):
+#   JJJJ-MM-TT - Zahlungsbestätigung PayPal - Lieferant - Rechnungsnummer[ - KÜRZEL].pdf
+BELEGMUSTER = re.compile(r"^\d{4}-\d{2}-\d{2} - Zahlungsbestätigung PayPal - .+ - .+\.pdf$", re.IGNORECASE)
+
+# Ein PayPal-Beleg hat einen Transaktionscode UND typische Texte des Belegs.
+# Rechnungen von Händlern, die nur "Payment Type: PayPal" oder "Transaction ID"
+# enthalten, haben diese Texte nicht und bleiben Rechnungen.
+PAYPAL_CODE = re.compile(r"Transaktionscode|Transaction\s+(?:ID|code)", re.IGNORECASE)
+PAYPAL_BELEG = re.compile(
+	r"Käuferschutz|Bestellübersicht|Zahlung\s+gesendet|Buyer\s+Protection|Purchase\s+Protection|You\s+sent\s+a\s+payment",
+	re.IGNORECASE,
+)
+RE_ZAHL = r"\d[\d.,]*\d|\d"
+SYMBOLE = {"€": "EUR", "$": "USD", "£": "GBP"}
+
+
+def ist_belegname(dateiname):
+	return bool(BELEGMUSTER.match(unicodedata.normalize("NFC", dateiname or "")))
+
+
+def paypal_beleg(text):
+	"""Erkennt einen PayPal-Zahlungsbeleg und liest ihn aus, sonst None.
+
+	Rückgabe: transaktionscode, rechnungsnummer (die der Händler an PayPal gab,
+	oft die Transaction ID auf seiner Rechnung), verkaeufer, datum, betrag +
+	waehrung (wie beim Händler bezahlt), betrag_eur und kurs (falls umgerechnet).
+	"""
+	if not text or "paypal" not in text.lower():
+		return None
+	if not (PAYPAL_CODE.search(text) and PAYPAL_BELEG.search(text)):
+		return None
+	b = {"transaktionscode": "", "rechnungsnummer": "", "verkaeufer": "", "datum": "",
+		"betrag": None, "waehrung": "", "betrag_eur": None, "kurs": None}
+
+	m = re.search(r"(?:Transaktionscode|Transaction\s+(?:ID|code))\s*:?\s*\n?\s*([A-Z0-9]{17})\b", text, re.IGNORECASE)
+	if m:
+		b["transaktionscode"] = m.group(1).upper()
+	m = re.search(r"(?:Rechnungsnummer|Rechnungs-?\s?Nr\.?|Invoice\s+(?:ID|number|no\.?))\s*:?\s*\n?\s*"
+		r"([A-Z0-9][A-Z0-9\-/_.]{2,40})", text, re.IGNORECASE)
+	if m:
+		b["rechnungsnummer"] = m.group(1).rstrip(".-/")
+	m = re.search(r"(?:Verkäufer|Seller(?:\s+info)?)\s*:?\s*\n\s*([^\n]+)", text, re.IGNORECASE)
+	if not m:
+		m = re.match(r"\s*([^\n]+?)\s+[−\-–]\s?\d", text)  # erste Zeile "Firma −12,34 $ USD"
+	if m:
+		b["verkaeufer"] = saeubern(m.group(1))
+	d = finde_datum(text)
+	b["datum"] = f"{d:%Y-%m-%d}" if d else ""
+
+	m = re.search(rf"(?:Summe|Total)\s*:?\s*({RE_ZAHL})\s*([€$£])?\s*([A-Z]{{3}})?", text)
+	if m:
+		try:
+			b["betrag"] = zahl(m.group(1))
+			b["waehrung"] = m.group(3) or SYMBOLE.get(m.group(2) or "", "")
+		except ValueError:
+			pass
+	# "139,90 € EUR = 147,99 $ USD"
+	m = re.search(rf"({RE_ZAHL})\s*€?\s*EUR\s*=\s*({RE_ZAHL})\s*[^\d\s]?\s*([A-Z]{{3}})", text)
+	if m:
+		try:
+			b["betrag_eur"] = zahl(m.group(1))
+			if b["betrag"] is None:
+				b["betrag"], b["waehrung"] = zahl(m.group(2)), m.group(3)
+		except ValueError:
+			pass
+	m = re.search(rf"1\s*EUR\s*=\s*({RE_ZAHL})\s*[^\d\s]?\s*([A-Z]{{3}})", text)
+	if m:
+		try:
+			b["kurs"] = zahl(m.group(1))
+		except ValueError:
+			pass
+	if b["betrag_eur"] is None and b["waehrung"] == "EUR":
+		b["betrag_eur"] = b["betrag"]
+	return b
+
+
 # ---------------------------------------------------------------- Gesamtauswertung
 
 def analysiere(pfad, bekannte, eigene):
@@ -352,6 +430,7 @@ def analysiere(pfad, bekannte, eigene):
 	except Exception as fehler:
 		info["grund"] = f"PDF nicht lesbar ({fehler})"
 		return info
+	info["paypal"] = paypal_beleg(text)
 
 	if xml:
 		ex = lies_factur_x(xml)
@@ -426,6 +505,19 @@ def zerlege_namen(dateiname, kuerzel_liste=()):
 		return None
 	# Lieferant darf " - " enthalten -> Nummer ist immer das letzte Teil
 	return {"datum": datum, "lieferant": " - ".join(rest[:-1]), "nummer": rest[-1], "kuerzel": kuerzel}
+
+
+def belegname(datum, lieferant, nummer, kuerzel=""):
+	return zielname(datum, lieferant, nummer, kuerzel).replace(" - Rechnung - ", " - Zahlungsbestätigung PayPal - ", 1)
+
+
+def zerlege_belegnamen(dateiname, kuerzel_liste=()):
+	"""Wie zerlege_namen, für '… - Zahlungsbestätigung PayPal - …'."""
+	if not ist_belegname(dateiname):
+		return None
+	name = re.sub(r" - Zahlungsbestätigung PayPal - ", " - Rechnung - ",
+		unicodedata.normalize("NFC", dateiname), count=1, flags=re.IGNORECASE)
+	return zerlege_namen(name, kuerzel_liste)
 
 
 def freier_name(ordner, wunsch):

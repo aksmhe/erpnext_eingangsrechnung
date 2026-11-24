@@ -13,3 +13,12 @@ doctype_list_js = {"Purchase Invoice": "public/js/purchase_invoice_list.js"}
 scheduler_events = {
     "hourly": ["erpnext_eingangsrechnung.api.stuendlich"],
 }
+
+# Gelöschte Eingangsrechnungen: Verknüpfung in "Eingangsrechnung Datei" lösen,
+# statt das Löschen zu blockieren
+doc_events = {
+    "Purchase Invoice": {
+        "on_trash": "erpnext_eingangsrechnung.api.rechnung_geloescht",
+    },
+}
+ignore_links_on_delete = ["Eingangsrechnung Datei"]

@@ -76,7 +76,8 @@ erpnext_eingangsrechnung.dialog = function (listview, daten, manuell) {
 				<td style="max-width:260px">
 					<a href="${link}" target="_blank" rel="noopener">${esc(f.datei)}</a>
 					<div class="text-muted small">${esc(f.ordner)}</div>
-					${f.grund ? `<div class="small" style="color:var(--red-600)">${esc(f.grund)}</div>` : ""}
+					${f.art === "paypal" ? `<span class="indicator-pill blue">${__("PayPal-Zahlungsbeleg")}</span>` : ""}
+					${f.grund ? `<div class="small" style="color:${f.art === "paypal" ? "var(--blue-600)" : "var(--red-600)"}">${esc(f.grund)}</div>` : ""}
 					${betrag ? `<div class="text-muted small">${__("Betrag")}: ${betrag}</div>` : ""}
 				</td>
 				<td><select class="form-control input-xs eri-aktion">
@@ -103,6 +104,9 @@ erpnext_eingangsrechnung.dialog = function (listview, daten, manuell) {
 				<p class="text-muted">${__(
 					"Diese PDFs sind noch nicht nach dem Schema „JJJJ-MM-TT - Rechnung - Lieferant - Nummer“ benannt. Bitte prüfen und bestätigen. Danach werden Entwürfe angelegt (nicht gebucht)."
 				)}</p>
+				<p class="text-muted small">${__(
+					"PayPal-Zahlungsbelege werden als „JJJJ-MM-TT - Zahlungsbestätigung PayPal - Lieferant - Rechnungsnummer“ benannt, an die passende Rechnung gehängt und nie als eigene Rechnung angelegt."
+				)}</p>
 				<div style="overflow-x:auto"><table class="table table-bordered table-sm">
 					<thead><tr>
 						<th>${__("Datei")}</th><th>${__("Aktion")}</th><th>${__("Rechnungsdatum")}</th>
@@ -120,6 +124,7 @@ erpnext_eingangsrechnung.dialog = function (listview, daten, manuell) {
 				const f = daten.umbenennen[tr.data("i")];
 				auftraege.push({
 					pfad: f.pfad,
+					art: f.art || "",
 					aktion: tr.find(".eri-aktion").val(),
 					datum: tr.find(".eri-datum").val(),
 					lieferant: tr.find(".eri-lieferant").val(),
@@ -170,7 +175,7 @@ erpnext_eingangsrechnung.erfassen = function (listview, manuell, vorher) {
 			const b = r.message || {};
 			// Ergebnis eines früheren Laufs (vor dem Anlegen neuer Lieferanten) mit anzeigen
 			if (vorher) {
-				["angelegt", "vorhanden", "verschoben"].forEach((k) => {
+				["angelegt", "vorhanden", "verschoben", "belege"].forEach((k) => {
 					b[k] = (vorher[k] || []).concat(b[k] || []);
 				});
 			}
@@ -210,6 +215,19 @@ erpnext_eingangsrechnung.ergebnis = function (listview, manuell, b) {
 		teile.push(
 			`<b>${__("Schon in ERPNext")}</b><br>` +
 				b.vorhanden.map((x) => `${link(x.rechnung)} – ${esc(x.hinweis || "")}`).join("<br>")
+		);
+	}
+	if ((b.belege || []).length) {
+		teile.push(
+			`<b>${__("PayPal-Zahlungsbelege")}</b><br>` +
+				b.belege
+					.map(
+						(x) =>
+							`${x.rechnung ? link(x.rechnung) : __("ohne Rechnung")} – ${esc(x.neu || x.datei)}${
+								x.hinweis ? `<div class="text-muted small">${esc(x.hinweis)}</div>` : ""
+							}`
+					)
+					.join("<br>")
 		);
 	}
 	if ((b.verschoben || []).length) {

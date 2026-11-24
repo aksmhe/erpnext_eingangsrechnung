@@ -21,7 +21,7 @@ from pathlib import Path
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate, now_datetime
+from frappe.utils import add_days, cint, flt, getdate, now_datetime
 
 from erpnext_eingangsrechnung import erkennung as e
 from erpnext_eingangsrechnung import lieferant as lf
@@ -170,7 +170,7 @@ def pruefen(manuell=0):
 		bekannt = nach_pfad.get(rel)
 		if bekannt and bekannt.status == "Ignoriert" and bekannt.groesse == st.st_size:
 			continue
-		schluessel = f"erpnext_eingangsrechnung|{rel}|{st.st_mtime}|{st.st_size}"
+		schluessel = f"erpnext_eingangsrechnung|v2|{rel}|{st.st_mtime}|{st.st_size}"
 		info = cache.get_value(schluessel)
 		if info is None:
 			info = e.analysiere(pfad, bekannte, eigene)
@@ -178,17 +178,33 @@ def pruefen(manuell=0):
 			cache.set_value(schluessel, info, expires_in_sec=7 * 24 * 3600)
 		if info["sha256"] in nach_hash and nach_hash[info["sha256"]].status == "Ignoriert":
 			continue
-		liste.append({
+		eintrag = {
 			"pfad": rel,
 			"datei": pfad.name,
 			"ordner": str(Path(rel).parent) if "/" in rel else "",
+			"art": "",
 			"datum": info.get("datum") or "",
 			"lieferant": info.get("lieferant") or "",
 			"nummer": info.get("nummer") or "",
 			"betrag": info.get("betrag"),
 			"quelle": info.get("quelle") or "",
 			"grund": info.get("grund") or "",
-		})
+		}
+		beleg = info.get("paypal")
+		if beleg:
+			# Zahlungsbeleg: wird nach der Rechnung benannt, zu der er gehört
+			rechnung = _rechnung_zum_beleg(einst, ordner, beleg, None, info["sha256"]) if einst.firma else None
+			bill_no = frappe.db.get_value("Purchase Invoice", rechnung, "bill_no") if rechnung else None
+			eintrag.update({
+				"art": "paypal",
+				"datum": beleg.get("datum") or eintrag["datum"],
+				"lieferant": beleg.get("verkaeufer") or eintrag["lieferant"],
+				"nummer": e.saeubern(bill_no or beleg.get("rechnungsnummer") or beleg.get("transaktionscode") or ""),
+				"betrag": beleg.get("betrag_eur") or beleg.get("betrag"),
+				"grund": (_("PayPal-Zahlungsbeleg zu Rechnung {0} – keine eigene Rechnung.").format(rechnung)
+					if rechnung else _("PayPal-Zahlungsbeleg – keine eigene Rechnung. Passende Rechnung noch nicht gefunden.")),
+			})
+		liste.append(eintrag)
 	return {
 		"aktiv": 1,
 		"umbenennen": liste,
@@ -238,7 +254,8 @@ def umbenennen(auftraege):
 		if kuerzel and kuerzel not in erlaubte_kuerzel:
 			ergebnis.append({"pfad": a.get("pfad"), "ok": 0, "meldung": _("Unbekanntes Kürzel {0}.").format(kuerzel)})
 			continue
-		ziel = e.freier_name(pfad.parent, e.zielname(datum, lieferant, nummer, kuerzel))
+		namensfunktion = e.belegname if a.get("art") == "paypal" else e.zielname
+		ziel = e.freier_name(pfad.parent, namensfunktion(datum, lieferant, nummer, kuerzel))
 		try:
 			pfad.rename(ziel)
 		except OSError as fehler:
@@ -276,10 +293,11 @@ def _erfassen(einst):
 	kuerzel_liste = [z["kuerzel"] for z in zahler]
 	nach_hash, nach_pfad = _log_eintraege()
 
-	bericht = {"angelegt": [], "vorhanden": [], "verschoben": [], "fehler": [], "lieferant_fehlt": []}
+	bericht = {"angelegt": [], "vorhanden": [], "verschoben": [], "belege": [], "fehler": [], "lieferant_fehlt": []}
 	fehlende = {}
 	for pfad in e.pdf_dateien(ordner):
-		if not e.ZIELMUSTER.match(pfad.name) or e.KEINE_RECHNUNG.search(pfad.name):
+		ist_beleg = e.ist_belegname(pfad.name)
+		if not ist_beleg and (not e.ZIELMUSTER.match(pfad.name) or e.KEINE_RECHNUNG.search(pfad.name)):
 			continue
 		rel = _rel(ordner, pfad)
 		groesse = pfad.stat().st_size
@@ -293,6 +311,19 @@ def _erfassen(einst):
 				eintrag.pfad = rel
 			if not eintrag:
 				eintrag = frappe._dict(name=None, sha256=h, status=None, rechnung=None, lieferant=None)
+		if ist_beleg or eintrag.status == "Zahlungsbeleg":
+			# Zahlungsbeleg: nur der Rechnung zuordnen, nie als Rechnung anlegen
+			if not eintrag.rechnung:
+				try:
+					beleg = e.paypal_beleg(e.pdf_lesen(pfad)[0])
+					if beleg:
+						_beleg_verarbeiten(einst, ordner, pfad, rel, eintrag, beleg, kuerzel_liste, bericht)
+				except Exception as fehler:
+					frappe.db.rollback()
+					frappe.clear_last_message()
+					bericht["fehler"].append({"datei": rel, "meldung": _("Zahlungsbeleg: {0}").format(fehler)})
+			frappe.db.commit()
+			continue
 		if eintrag.status == "Ignoriert":
 			continue
 		if not eintrag.rechnung:
@@ -318,7 +349,7 @@ def _erfassen(einst):
 					pass
 				frappe.db.commit()
 				continue
-		if einst.verschieben and eintrag and eintrag.rechnung:
+		if einst.verschieben and eintrag and eintrag.rechnung and eintrag.status != "Zahlungsbeleg":
 			try:
 				_verschieben_wenn_bezahlt(einst, ordner, pfad, rel, eintrag, zahler, kuerzel_liste, bericht)
 			except Exception as fehler:
@@ -326,8 +357,9 @@ def _erfassen(einst):
 				bericht["fehler"].append({"datei": rel, "meldung": _("Verschieben: {0}").format(fehler)})
 		frappe.db.commit()
 
-	zusammenfassung = _("{0} Entwurf/Entwürfe angelegt, {1} vorhanden, {2} verschoben, {3} Fehler").format(
-		len(bericht["angelegt"]), len(bericht["vorhanden"]), len(bericht["verschoben"]), len(bericht["fehler"]))
+	zusammenfassung = _("{0} Entwurf/Entwürfe angelegt, {1} vorhanden, {2} verschoben, {3} Zahlungsbeleg(e), {4} Fehler").format(
+		len(bericht["angelegt"]), len(bericht["vorhanden"]), len(bericht["verschoben"]), len(bericht["belege"]),
+		len(bericht["fehler"]))
 	frappe.db.set_single_value(EINST, {"letzter_lauf": now_datetime(), "letztes_ergebnis": zusammenfassung})
 	frappe.db.commit()
 	bericht["zusammenfassung"] = zusammenfassung
@@ -416,6 +448,10 @@ def _neue_datei(einst, ordner, pfad, rel, eintrag, bekannte, eigene, kuerzel_lis
 	if not teile:
 		raise frappe.ValidationError(_("Dateiname passt nicht zum Schema."))
 	info = e.analysiere(pfad, bekannte, eigene)
+	if info.get("paypal"):
+		# PayPal-Zahlungsbeleg, obwohl als Rechnung benannt -> zuordnen statt anlegen
+		_beleg_verarbeiten(einst, ordner, pfad, rel, eintrag, info["paypal"], kuerzel_liste, bericht)
+		return frappe._dict(name=eintrag.name, sha256=eintrag.sha256, status="Zahlungsbeleg", rechnung=None, pfad=rel)
 	lieferant = eintrag.get("lieferant") or _alias(teile["lieferant"]) or _finde_lieferant(
 		teile["lieferant"], info.get("ust_ids"))
 	vorschlag = None
@@ -541,6 +577,150 @@ def _fremdwaehrung(firma, lieferant, waehrung, firmen_waehrung, betrag, datum):
 		"ACHTUNG: Rechnung über {0}. Der Betrag im Entwurf ist noch der {1}-Betrag – "
 		"bitte den tatsächlich gezahlten {2}-Betrag aus dem Kontoauszug eintragen.").format(
 		betrag_text, waehrung, firmen_waehrung)
+
+
+# ---------------------------------------------------------------- PayPal-Zahlungsbelege
+
+def _rechnung_zum_beleg(einst, ordner, beleg, lieferant=None, ausser_sha=None):
+	"""Eingangsrechnung, zu der ein PayPal-Beleg gehört, oder None.
+
+	1. Lieferanten-Rechnungsnummer = Rechnungsnummer/Transaktionscode im Beleg
+	2. Rechnungsnummer des Belegs steht in der PDF der Rechnung
+	   (z. B. als "Transaction ID" auf der Händlerrechnung)
+	3. Lieferant und Betrag passen zu genau einer Rechnung
+	"""
+	if not lieferant and beleg.get("verkaeufer"):
+		lieferant = _alias(beleg["verkaeufer"]) or _finde_lieferant(beleg["verkaeufer"], [])
+	filters = {"company": einst.firma, "docstatus": ["<", 2]}
+	if lieferant:
+		filters["supplier"] = lieferant
+	if beleg.get("datum"):
+		d = getdate(beleg["datum"])
+		filters["posting_date"] = ["between", [add_days(d, -31), add_days(d, 31)]]
+	kandidaten = frappe.get_all("Purchase Invoice", filters=filters,
+		fields=["name", "bill_no", "grand_total"], order_by="posting_date desc", limit=100)
+	# Rechnungen, die (fälschlich) aus diesem Beleg selbst angelegt wurden, nie nehmen
+	if ausser_sha:
+		aus_beleg = set(frappe.get_all(LOG, filters={"sha256": ausser_sha, "rechnung": ["is", "set"]}, pluck="rechnung"))
+		kandidaten = [k for k in kandidaten if k.name not in aus_beleg]
+
+	nummern = [n for n in (beleg.get("rechnungsnummer"), beleg.get("transaktionscode")) if n]
+	schluessel = {e.nummer_schluessel(n) for n in nummern}
+	for k in kandidaten:
+		if k.bill_no and e.nummer_schluessel(k.bill_no) in schluessel:
+			return k.name
+	for k in kandidaten:
+		for pfad_rel in frappe.get_all(LOG, filters={"rechnung": k.name, "status": ["!=", "Zahlungsbeleg"]}, pluck="pfad"):
+			pdf = ordner / pfad_rel
+			if not pdf.is_file():
+				continue
+			try:
+				text = e.pdf_lesen(pdf)[0]
+			except Exception:
+				continue
+			if any(n in text for n in nummern):
+				return k.name
+	if lieferant:
+		betraege = [b for b in (beleg.get("betrag"), beleg.get("betrag_eur")) if b]
+		passend = [k for k in kandidaten if any(abs(flt(k.grand_total) - b) < 0.015 for b in betraege)]
+		if len(passend) == 1:
+			return passend[0].name
+	return None
+
+
+def _geld(betrag):
+	return f"{flt(betrag):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _euro_betrag_uebernehmen(pi, beleg):
+	"""Nur bei Entwürfen: tatsächlich gezahlten Euro-Betrag aus dem PayPal-Beleg eintragen."""
+	if pi.docstatus != 0:
+		return ""
+	firmen_waehrung = frappe.get_cached_value("Company", pi.company, "default_currency")
+	eur, fremd, waehrung = beleg.get("betrag_eur"), beleg.get("betrag"), beleg.get("waehrung")
+	if firmen_waehrung != "EUR" or not eur or not fremd or not waehrung or waehrung == "EUR":
+		return ""
+	if pi.currency == waehrung:
+		pi.conversion_rate = flt(eur / fremd, 9)
+		hinweis = _("Kurs aus PayPal-Beleg übernommen: bezahlt {0} EUR = {1} {2}.").format(_geld(eur), _geld(fremd), waehrung)
+	elif pi.currency == firmen_waehrung and len(pi.items) == 1 and abs(flt(pi.items[0].rate) - fremd) < 0.015:
+		pi.items[0].rate = eur
+		hinweis = _("Betrag aus PayPal-Beleg übernommen: {0} {1} = {2} EUR tatsächlich bezahlt.").format(_geld(fremd), waehrung, _geld(eur))
+	else:
+		return ""
+	pi.remarks = ((pi.remarks or "") + "\n" + hinweis).strip()
+	pi.save()
+	return hinweis
+
+
+def _beleg_verarbeiten(einst, ordner, pfad, rel, eintrag, beleg, kuerzel_liste, bericht):
+	"""PayPal-Beleg der Rechnung zuordnen: umbenennen, anhängen, Euro-Betrag übernehmen.
+	Als bezahlt markiert wird nichts – das bleibt beim Bankabgleich bzw. beim Zahler."""
+	teile = e.zerlege_namen(pfad.name, kuerzel_liste) or e.zerlege_belegnamen(pfad.name, kuerzel_liste)
+	lieferant = None
+	if teile:
+		lieferant = _alias(teile["lieferant"]) or _finde_lieferant(teile["lieferant"], [])
+	rechnung = _rechnung_zum_beleg(einst, ordner, beleg, lieferant, eintrag.sha256)
+	code = beleg.get("transaktionscode") or beleg.get("rechnungsnummer") or ""
+
+	if not rechnung:
+		hinweis = _("PayPal-Zahlungsbeleg {0}: noch keine passende Eingangsrechnung gefunden. "
+			"Wird beim nächsten Lauf erneut gesucht.").format(code)
+		_log_setzen(eintrag.name or frappe.db.get_value(LOG, {"sha256": eintrag.sha256}),
+			pfad=rel, sha256=eintrag.sha256, groesse=pfad.stat().st_size, status="Zahlungsbeleg",
+			rechnung=None, hinweis=hinweis)
+		bericht["belege"].append({"datei": rel, "rechnung": None, "hinweis": hinweis})
+		return
+
+	pi = frappe.get_doc("Purchase Invoice", rechnung)
+	# Einheitlich neben der Rechnung benennen: "… - Zahlungsbestätigung PayPal - Lieferant - Rechnungsnr[ - KÜRZEL]"
+	datum = (teile or {}).get("datum") or beleg.get("datum") or str(pi.bill_date or pi.posting_date)
+	lieferant_name = (teile or {}).get("lieferant") or beleg.get("verkaeufer") or pi.supplier_name or pi.supplier
+	neu = e.belegname(datum, lieferant_name, pi.bill_no or pi.name, (teile or {}).get("kuerzel", ""))
+	alter_rel = rel
+	if pfad.name != neu:
+		try:
+			ziel = e.freier_name(pfad.parent, neu)
+			pfad.rename(ziel)
+			pfad, rel = ziel, _rel(ordner, ziel)
+		except OSError:
+			pass
+
+	hinweise = []
+	if not frappe.db.exists("File", {"attached_to_doctype": "Purchase Invoice", "attached_to_name": rechnung,
+			"file_name": pfad.name}):
+		_anhaengen(rechnung, pfad)
+		hinweise.append(_("Beleg angehängt."))
+	try:
+		h = _euro_betrag_uebernehmen(pi, beleg)
+		if h:
+			hinweise.append(h)
+	except Exception as fehler:
+		frappe.clear_last_message()
+		hinweise.append(_("Euro-Betrag nicht übernommen: {0}").format(fehler))
+	text = _("PayPal-Zahlungsbeleg {0} zugeordnet ({1}).").format(code, pfad.name)
+	if beleg.get("betrag_eur") and beleg.get("waehrung") and beleg["waehrung"] != "EUR":
+		text += " " + _("Bezahlt: {0} EUR = {1} {2}.").format(_geld(beleg["betrag_eur"]), _geld(beleg.get("betrag")), beleg["waehrung"])
+	pi.add_comment("Comment", text=" ".join([text] + hinweise))
+
+	hinweis = " ".join([_("Zahlungsbeleg zu {0}.").format(rechnung)] + hinweise)
+	_log_setzen(eintrag.name or frappe.db.get_value(LOG, {"sha256": eintrag.sha256}),
+		pfad=rel, sha256=eintrag.sha256, groesse=pfad.stat().st_size, status="Zahlungsbeleg",
+		rechnung=rechnung, hinweis=hinweis[:500])
+	bericht["belege"].append({"datei": alter_rel, "neu": rel if rel != alter_rel else "", "rechnung": rechnung,
+		"hinweis": " ".join(hinweise)})
+
+
+def rechnung_geloescht(doc, method=None):
+	"""Beim Löschen einer Eingangsrechnung die Verknüpfung in 'Eingangsrechnung Datei' lösen,
+	damit das Löschen nicht blockiert. Die Datei wird beim nächsten Lauf neu geprüft."""
+	for log in frappe.get_all(LOG, filters={"rechnung": doc.name}, fields=["name", "status"]):
+		werte = {"rechnung": None}
+		if log.status != "Zahlungsbeleg":
+			werte.update({"status": "Fehler", "hinweis": _(
+				"Eingangsrechnung {0} wurde gelöscht. Die Datei wird beim nächsten Lauf neu erfasst – "
+				"ist sie keine Rechnung, bitte umbenennen (z. B. 'Zahlungsbestätigung').").format(doc.name)})
+		frappe.db.set_value(LOG, log.name, werte)
 
 
 # ---------------------------------------------------------------- Neue Lieferanten
@@ -832,6 +1012,17 @@ def _verschieben_wenn_bezahlt(einst, ordner, pfad, rel, eintrag, zahler, kuerzel
 	frappe.db.set_value(LOG, eintrag.name, {"pfad": neu_rel, "status": "Verschoben", "rechnung": rechnung,
 		"hinweis": _("Bezahlt – verschoben aus {0}").format(rel)})
 	bericht["verschoben"].append({"datei": rel, "nach": neu_rel, "rechnung": rechnung})
+
+	# Zugeordnete Zahlungsbelege aus dem Ordner für offene Rechnungen mitnehmen
+	for beleg in frappe.get_all(LOG, filters={"rechnung": ["in", list({eintrag.rechnung, rechnung})],
+			"status": "Zahlungsbeleg"}, fields=["name", "pfad"]):
+		quelle = ordner / beleg.pfad
+		if not quelle.is_file() or not (beleg.pfad + "/").startswith(offen + "/"):
+			continue
+		ziel_beleg = e.freier_name(ziel_ordner, quelle.name)
+		shutil.move(str(quelle), str(ziel_beleg))
+		frappe.db.set_value(LOG, beleg.name, "pfad", _rel(ordner, ziel_beleg))
+		bericht["verschoben"].append({"datei": beleg.pfad, "nach": _rel(ordner, ziel_beleg), "rechnung": rechnung})
 
 
 # ---------------------------------------------------------------- PDF ansehen

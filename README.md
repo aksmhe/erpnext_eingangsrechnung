@@ -21,6 +21,9 @@ Alles läuft auf dem eigenen Server. Es werden **keine Cloud- oder KI-Dienste** 
 5. **Vorhandene Rechnungen** (gleicher Lieferant + Rechnungsnummer) werden nicht doppelt angelegt; die PDF wird auf Wunsch angehängt, wenn noch keine da ist.
 6. **Bezahlte Rechnungen verschieben (optional):** Liegt eine Rechnung im Ordner für offene Rechnungen und ist sie in ERPNext bezahlt, wird die Datei in den Zielordner verschoben – je nach Zahlung vom Firmenkonto oder privat (Buchungssatz auf das Konto eines „Zahlers“, z. B. Privateinlage). Bei privater Zahlung wird das Kürzel an den Dateinamen gehängt.
 
+7. **PayPal-Zahlungsbelege:** PayPal-Belege (Transaktionscode, „Bestellübersicht“, „Käuferschutz“) werden nie als eigene Rechnung angelegt. Die App sucht die passende Eingangsrechnung (Rechnungsnummer, Transaction ID in der Händlerrechnung oder Lieferant + Betrag), benennt den Beleg `JJJJ-MM-TT - Zahlungsbestätigung PayPal - Lieferant - Rechnungsnummer[ - KÜRZEL].pdf`, hängt ihn an die Rechnung und vermerkt den tatsächlich gezahlten Euro-Betrag. Bei **Entwürfen** in Fremdwährung wird dieser Euro-Betrag (bzw. der Kurs) übernommen; gebuchte Rechnungen bleiben unverändert. Als bezahlt markiert wird nichts – das bleibt beim Bankabgleich bzw. beim Zahler. Wird die Rechnung verschoben, wandert der Beleg mit. Händlerrechnungen, auf denen nur „Payment Type: PayPal“ steht, bleiben normale Rechnungen.
+8. **Gelöschte Entwürfe:** Eine Eingangsrechnung lässt sich jetzt löschen, auch wenn sie mit einer Datei verknüpft ist. Die Datei wird beim nächsten Lauf neu geprüft.
+
 Jede verarbeitete Datei steht in der Liste **Eingangsrechnung Datei** (Status, Rechnung, Prüfsumme). Dateien werden über ihre SHA-256-Prüfsumme wiedererkannt, auch wenn sie verschoben oder umbenannt wurden.
 
 ### Erkennung (Regeln, ohne KI)
